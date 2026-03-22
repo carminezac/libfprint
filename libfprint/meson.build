@@ -137,10 +137,13 @@ driver_sources = {
         [ 'drivers/virtual-device-storage.c' ],
     'synaptics' :
         [ 'drivers/synaptics/synaptics.c', 'drivers/synaptics/bmkt_message.c' ],
-    'goodixmoc' :
-        [ 'drivers/goodixmoc/goodix.c', 'drivers/goodixmoc/goodix_proto.c' ],
+    # 'goodixmoc' disabled — conflicts with goodixtls5e0a for USB 27c6:5e0a
+    # 'goodixmoc' :
+    #     [ 'drivers/goodixmoc/goodix.c', 'drivers/goodixmoc/goodix_proto.c' ],
     'goodixtls511' :
         [ 'drivers/goodixtls/goodix511.c' ],
+    'goodixtls5e0a' :
+        [ 'drivers/goodixtls/goodix5e0a.c' ],
     'fpcmoc' :
         [ 'drivers/fpcmoc/fpc.c' ],
 }
