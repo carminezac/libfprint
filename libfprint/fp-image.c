@@ -320,6 +320,10 @@ fp_image_detect_minutiae_thread_func (GTask        *task,
       return;
     }
 
+  if (data->minutiae)
+    fp_dbg ("Minutiae found: %d (image %dx%d, ppmm=%.1f)",
+            data->minutiae->num, data->width, data->height, data->ppmm);
+
   if (!data->minutiae || data->minutiae->num == 0)
     {
       g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
