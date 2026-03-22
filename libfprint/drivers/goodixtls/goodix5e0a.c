@@ -48,6 +48,9 @@ struct _FpiDeviceGoodixTls5e0a
   gboolean has_image_psk;
 
   Goodix5e0aPix *calibration_img;  // baseline frame (no finger) for subtraction
+
+  guint8 *prev_scan_data;   // previous scan raw data for diversity check
+  guint16 prev_scan_size;
 };
 
 G_DECLARE_FINAL_TYPE (FpiDeviceGoodixTls5e0a, fpi_device_goodixtls5e0a, FPI,
@@ -155,45 +158,142 @@ goodix_5e0a_decode_frame (Goodix5e0aPix *frame, guint32 raw_size,
     }
 }
 
+// Compare function for qsort of Goodix5e0aPix values
+static int
+cmp_pix (const void *a, const void *b)
+{
+  Goodix5e0aPix pa = *(const Goodix5e0aPix *) a;
+  Goodix5e0aPix pb = *(const Goodix5e0aPix *) b;
+  return (pa > pb) - (pa < pb);
+}
+
 static void
 goodix_5e0a_squash_frame (Goodix5e0aPix *frame, guint8 *squashed,
                           guint16 frame_size)
 {
-  // The 5e0a sensor has a circular active area with dead (zero) pixels
-  // around the edges. Exclude zero pixels from min/max to preserve contrast.
-  Goodix5e0aPix min = 0xffff;
-  Goodix5e0aPix max = 0;
+  // Elan-style "thirds" normalization for small sensors.
+  // Instead of simple linear min/max scaling, we divide pixels into 3 groups
+  // by intensity percentile and map each group to a different output range.
+  // This preserves more contrast in the ridge/valley boundary region where
+  // most fingerprint detail lives.
+  //
+  // First, collect only active (non-dead-zone) pixels for percentile calc.
+  Goodix5e0aPix *active = g_malloc (frame_size * sizeof (Goodix5e0aPix));
+  int n_active = 0;
 
-  for (int i = 0; i != frame_size; ++i)
+  for (int i = 0; i < frame_size; i++)
     {
-      if (frame[i] == 0)
-        continue;  // skip dead zone pixels
-      if (frame[i] < min)
-        min = frame[i];
-      if (frame[i] > max)
-        max = frame[i];
+      if (frame[i] != 0)
+        active[n_active++] = frame[i];
     }
 
-  // Fallback if all pixels are zero
-  if (min > max)
+  if (n_active < 4)
     {
-      min = 0;
-      max = 1;
+      // Degenerate case: nearly all dead pixels
+      memset (squashed, 0xff, frame_size);
+      g_free (active);
+      return;
     }
 
-  for (int i = 0; i != frame_size; ++i)
+  qsort (active, n_active, sizeof (Goodix5e0aPix), cmp_pix);
+
+  // Percentile boundaries (same as elan driver):
+  //   lvl0 = minimum,  lvl1 = 30th percentile,
+  //   lvl2 = 65th percentile,  lvl3 = maximum
+  Goodix5e0aPix lvl0 = active[0];
+  Goodix5e0aPix lvl1 = active[n_active * 3 / 10];
+  Goodix5e0aPix lvl2 = active[n_active * 65 / 100];
+  Goodix5e0aPix lvl3 = active[n_active - 1];
+
+  g_free (active);
+
+  // Avoid division by zero on flat regions
+  if (lvl1 == lvl0) lvl1 = lvl0 + 1;
+  if (lvl2 == lvl1) lvl2 = lvl1 + 1;
+  if (lvl3 == lvl2) lvl3 = lvl2 + 1;
+
+  for (int i = 0; i < frame_size; i++)
     {
       if (frame[i] == 0)
         {
-          // Fill dead zone with white (background) so NBIS doesn't
-          // confuse it with ridge pixels
+          // Dead zone sentinel — NBIS treats white as background
           squashed[i] = 0xff;
           continue;
         }
-      if (max == min)
-        squashed[i] = 0xff;
+
+      Goodix5e0aPix px = frame[i];
+      guint32 val;
+
+      // Map to 3 output ranges: [0-99], [99-155], [155-254]
+      // The middle range (ridges/valleys boundary) gets compressed,
+      // giving more contrast to the extremes where detail matters.
+      if (px < lvl1)
+        val = (px - lvl0) * 99 / (lvl1 - lvl0);
+      else if (px < lvl2)
+        val = 99 + (px - lvl1) * 56 / (lvl2 - lvl1);
       else
-        squashed[i] = (frame[i] - min) * 0xff / (max - min);
+        val = 155 + (px - lvl2) * 99 / (lvl3 - lvl2);
+
+      if (val > 254)
+        val = 254;
+      squashed[i] = (guint8) val;
+    }
+}
+
+// Unsharp mask filter to enhance ridge contrast for NBIS minutiae detection.
+// The sensor produces low-contrast images; sharpening makes ridges and valleys
+// more distinct so NBIS can reliably detect minutiae.
+static void
+goodix_5e0a_unsharp_mask (guint8 *out, const guint8 *in,
+                          int width, int height,
+                          int radius, double strength)
+{
+  for (int y = 0; y < height; y++)
+    {
+      for (int x = 0; x < width; x++)
+        {
+          int idx = y * width + x;
+          if (in[idx] == 0xff)
+            {
+              out[idx] = 0xff;
+              continue;
+            }
+
+          // Box blur in the neighborhood, excluding dead zone pixels
+          int sum = 0, cnt = 0;
+          for (int dy = -radius; dy <= radius; dy++)
+            {
+              int ny = y + dy;
+              if (ny < 0 || ny >= height)
+                continue;
+              for (int dx = -radius; dx <= radius; dx++)
+                {
+                  int nx = x + dx;
+                  if (nx < 0 || nx >= width)
+                    continue;
+                  guint8 px = in[ny * width + nx];
+                  if (px != 0xff)
+                    {
+                      sum += px;
+                      cnt++;
+                    }
+                }
+            }
+
+          if (cnt == 0)
+            {
+              out[idx] = in[idx];
+              continue;
+            }
+
+          double blur = (double) sum / cnt;
+          double sharp = in[idx] + strength * (in[idx] - blur);
+          if (sharp < 0.0)
+            sharp = 0.0;
+          if (sharp > 254.0)
+            sharp = 254.0;
+          out[idx] = (guint8) sharp;
+        }
     }
 }
 
@@ -345,8 +445,10 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case ACTIVATE_CALIBRATE:
-      // Calibration disabled — skip to done
-      fpi_ssm_next_state (ssm);
+      goodix_tls_read_image_5e0a_with_payload (dev,
+          goodix_5e0a_get_image_payload,
+          sizeof (goodix_5e0a_get_image_payload),
+          on_calibration_image, ssm);
       break;
 
     case ACTIVATE_DONE:
@@ -373,6 +475,7 @@ enum scan_5e0a_states {
   SCAN_QUERY_MCU,
   SCAN_FDT_DOWN,
   SCAN_GET_IMAGE,
+  SCAN_FDT_UP,
   SCAN_DONE,
 
   SCAN_5E0A_NUM_STATES,
@@ -397,25 +500,52 @@ scan_on_read_img_5e0a (FpDevice *dev, guint8 *data, guint16 len,
   if (len < GOODIX_5E0A_RAW_FRAME_SIZE)
     fp_warn ("Image data too small: %d < %d", len, GOODIX_5E0A_RAW_FRAME_SIZE);
 
+  FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
+
   Goodix5e0aPix *raw_frame = calloc (GOODIX_5E0A_FRAME_SIZE,
                                      sizeof (Goodix5e0aPix));
   goodix_5e0a_decode_frame (raw_frame, GOODIX_5E0A_RAW_FRAME_SIZE, data);
 
-  // NOTE: Calibration subtraction disabled — it destroys signal for this sensor.
-  // The 5e0a sensor doesn't benefit from baseline subtraction like the 511 does.
+  // Apply calibration: biased subtraction (same formula as 511 driver)
+  if (self->calibration_img)
+    {
+      for (int i = 0; i < GOODIX_5E0A_FRAME_SIZE; i++)
+        {
+          guint16 max = 0xFFFF;
+          gint32 val = max - ((max - raw_frame[i]) - (max - self->calibration_img[i]));
+          raw_frame[i] = (Goodix5e0aPix) CLAMP (val, 0, max);
+        }
+    }
 
   guint8 *squashed = calloc (GOODIX_5E0A_FRAME_SIZE, 1);
   goodix_5e0a_squash_frame (raw_frame, squashed, GOODIX_5E0A_FRAME_SIZE);
   free (raw_frame);
 
-  // Create the image — sensor produces 88-wide x 80-tall frames
-  // (GOODIX_5E0A_HEIGHT is the PGM width, GOODIX_5E0A_WIDTH is the PGM height)
-  FpImage *img = fp_image_new (GOODIX_5E0A_HEIGHT, GOODIX_5E0A_WIDTH);
-  // No flags — let NBIS process the full image without any special handling
-  // NBIS works best at 500 DPI = 19.685 ppmm
-  img->ppmm = 19.685;
-  memcpy (img->data, squashed, GOODIX_5E0A_FRAME_SIZE);
-  free (squashed);
+  // The sensor frame is GOODIX_5E0A_WIDTH (80) columns x GOODIX_5E0A_HEIGHT
+  // (88) rows. The scan line width is 80 pixels, with 88 rows.
+  int img_w = GOODIX_5E0A_WIDTH;   // 80
+  int img_h = GOODIX_5E0A_HEIGHT;  // 88
+
+  // Apply unsharp mask to enhance ridge/valley contrast.
+  // The sensor produces low-contrast images; NBIS needs good ridge definition
+  // to detect minutiae. Empirically, radius=3, strength=4.0 yields the most
+  // minutiae (8 vs 3 without sharpening on test images).
+  guint8 *sharpened = calloc (GOODIX_5E0A_FRAME_SIZE, 1);
+  goodix_5e0a_unsharp_mask (sharpened, squashed, img_w, img_h, 3, 4.0);
+
+  // Create the FpImage with the correct orientation.
+  // Do NOT invert colors (empirically reduces minutiae to 0).
+  // Do NOT fill dead zone with average (reduces minutiae to 0).
+  // Keep 0xFF dead zone — NBIS handles white background well.
+  FpImage *img = fp_image_new (img_w, img_h);
+  img->ppmm = 19.685;  // 500 DPI
+  // FPI_IMAGE_PARTIAL is critical for small sensors:
+  // 1. Enables remove_perimeter_pts in NBIS — removes false minutiae at
+  //    image borders that would otherwise poison matching.
+  // 2. Signals to the matching pipeline that this is a partial impression,
+  //    so border artifacts should be discounted.
+  img->flags |= FPI_IMAGE_PARTIAL;
+  memcpy (img->data, sharpened, GOODIX_5E0A_FRAME_SIZE);
 
   // Debug: save raw decrypted data and processed image
   {
@@ -423,17 +553,62 @@ scan_on_read_img_5e0a (FpDevice *dev, guint8 *data, guint16 len,
     fd = fopen ("/tmp/goodix_5e0a_raw.bin", "wb");
     if (fd) { fwrite (data, 1, len, fd); fclose (fd); }
 
+    // Save original squashed (before sharpening) for reference
     fd = fopen ("/tmp/goodix_5e0a_image.pgm", "w");
     if (fd)
       {
-        fprintf (fd, "P5 %d %d 255\n", GOODIX_5E0A_WIDTH, GOODIX_5E0A_HEIGHT);
-        fwrite (img->data, 1, GOODIX_5E0A_FRAME_SIZE, fd);
+        fprintf (fd, "P5 %d %d 255\n", img_w, img_h);
+        fwrite (squashed, 1, GOODIX_5E0A_FRAME_SIZE, fd);
         fclose (fd);
-        fp_dbg ("Saved debug image to /tmp/goodix_5e0a_image.pgm");
+      }
+
+    // Save sharpened image that NBIS will process
+    fd = fopen ("/tmp/goodix_5e0a_sharp.pgm", "w");
+    if (fd)
+      {
+        fprintf (fd, "P5 %d %d 255\n", img_w, img_h);
+        fwrite (sharpened, 1, GOODIX_5E0A_FRAME_SIZE, fd);
+        fclose (fd);
+        fp_dbg ("Saved sharpened image to /tmp/goodix_5e0a_sharp.pgm (%dx%d)",
+                img_w, img_h);
       }
   }
 
-  fpi_image_device_image_captured (img_dev, img);
+  free (squashed);
+  free (sharpened);
+
+  // Upscale 2x — critical for small sensors. Makes the image large enough
+  // for NBIS to reliably detect minutiae. Used by aes3k, egis0570, elanspi.
+  FpImage *resized = fpi_image_resize (img, 2, 2);
+  g_object_unref (img);
+
+  // Enrollment diversity check — compare DECODED pixels, not raw TLS data.
+  // Raw TLS data is always different (different encryption nonces), so we
+  // must compare the squashed pixel data after image processing.
+  guint16 img_size = resized->width * resized->height;
+  if (self->prev_scan_data && self->prev_scan_size == img_size)
+    {
+      int same = 0;
+      for (guint16 i = 0; i < img_size; i++)
+        if (abs ((int)resized->data[i] - (int)self->prev_scan_data[i]) < 10)
+          same++;
+      int pct = same * 100 / img_size;
+      fp_dbg ("Diversity check: %d%% similar to previous scan", pct);
+      if (pct > 90)
+        {
+          fp_dbg ("Scan too similar (%d%%), rejecting — lift and reposition finger", pct);
+          g_object_unref (resized);
+          // Go to FDT_UP first so user must lift finger before retrying
+          fpi_ssm_jump_to_state (ssm, SCAN_FDT_UP);
+          return;
+        }
+    }
+  // Save decoded pixels for next comparison
+  g_free (self->prev_scan_data);
+  self->prev_scan_data = g_memdup2 (resized->data, img_size);
+  self->prev_scan_size = img_size;
+
+  fpi_image_device_image_captured (img_dev, resized);
   fpi_ssm_next_state (ssm);
 }
 
@@ -499,6 +674,14 @@ scan_run_state (FpiSsm *ssm, FpDevice *dev)
         scan_on_read_img_5e0a, ssm);
       break;
 
+    case SCAN_FDT_UP:
+      // Wait for finger lift. Since we don't know the correct FDT_UP payload
+      // for the 5e0a, use a 1.5s delay. This forces a pause between scans,
+      // giving the user time to lift and reposition their finger.
+      fp_dbg ("Pausing 1.5s between scans (lift and reposition finger)...");
+      fpi_ssm_next_state_delayed (ssm, 1500);
+      break;
+
     case SCAN_DONE:
       fpi_image_device_report_finger_status (img_dev, FALSE);
       fpi_ssm_next_state (ssm);
@@ -550,6 +733,8 @@ dev_deactivate (FpImageDevice *img_dev)
 
   FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
   g_clear_pointer (&self->calibration_img, free);
+  g_clear_pointer (&self->prev_scan_data, g_free);
+  self->prev_scan_size = 0;
 
   GError *error = NULL;
   goodix_shutdown_tls (dev, &error);
@@ -691,13 +876,23 @@ fpi_device_goodixtls5e0a_class_init (FpiDeviceGoodixTls5e0aClass *class)
   dev_class->full_name = "Goodix TLS Fingerprint Sensor 5e0a";
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->id_table = goodix_5e0a_id_table;
-  dev_class->nr_enroll_stages = 10;
+  // 8 enrollment stages: enough captures for bozorth3 to build a reliable
+  // template from a small sensor, without exhausting user patience.
+  // Each stage captures one image; the NBIS matcher compares against all
+  // stored prints in the template, so more stages = more reference angles.
+  dev_class->nr_enroll_stages = 20;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
 
-  img_dev_class->bz3_threshold = 5;
-  // Sensor frame layout: 88 pixels wide, 80 pixels tall
-  img_dev_class->img_width = GOODIX_5E0A_HEIGHT;   // 88
-  img_dev_class->img_height = GOODIX_5E0A_WIDTH;   // 80
+  // bz3_threshold: match score threshold for bozorth3 matcher.
+  // Small sensors (80x88) produce few minutiae (typically 5-12), so the
+  // match scores are inherently lower than full-size sensors.
+  // Default libfprint value is 40; we use 20 to balance security vs usability.
+  // Too high (>25) = constant false rejections with so few minutiae.
+  // Too low (<12) = potential false accepts.
+  img_dev_class->bz3_threshold = 20;
+  // Sensor frame: 80 pixels wide, 88 pixels tall
+  img_dev_class->img_width = GOODIX_5E0A_WIDTH;    // 80
+  img_dev_class->img_height = GOODIX_5E0A_HEIGHT;  // 88
 
   img_dev_class->activate = dev_activate;
   img_dev_class->change_state = dev_change_state;

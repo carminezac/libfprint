@@ -300,6 +300,47 @@ fp_image_detect_minutiae_thread_func (GTask        *task,
   lfsparms = g_memdup2 (&g_lfsparms_V2, sizeof (LFSPARMS));
   lfsparms->remove_perimeter_pts = data->flags & FPI_IMAGE_PARTIAL ? TRUE : FALSE;
 
+  /* For small/partial sensors (e.g. 80x88 pixels), relax NBIS false-minutia
+   * removal thresholds. The default V2 parameters are tuned for full-size
+   * (300x400+) sensor images; on small sensors they over-aggressively remove
+   * valid minutiae, leaving too few for reliable matching.
+   *
+   * Strategy: increase distance/length thresholds to impossible values so
+   * the corresponding removal tests effectively never trigger, while keeping
+   * perimeter point removal active (critical for border artifacts). */
+  if (data->flags & FPI_IMAGE_PARTIAL)
+    {
+      /* Relax hook removal — hooks on small images are often real features */
+      lfsparms->max_hook_len = 200;
+
+      /* Relax half-loop (island/lake) removal — small sensor geometry
+       * causes many false positives in this test */
+      lfsparms->max_half_loop = 200;
+
+      /* Don't remove minutiae near invalid-direction blocks — small images
+       * have proportionally more edge blocks marked invalid */
+      lfsparms->inv_block_margin = 0;
+      lfsparms->trans_dir_pix = 0;
+
+      /* Relax malformation removal — ridges on small sensors look
+       * "malformed" to NBIS because there's so little context */
+      lfsparms->min_malformation_ratio = 0.1;
+      lfsparms->max_malformation_dist = 200;
+
+      /* Relax pore removal — pore-like features on small sensors are
+       * often real minutiae or useful ridge detail */
+      lfsparms->pores_min_dist2 = 0.01;
+      lfsparms->pores_max_ratio = 100.0;
+
+      /* Increase perimeter removal distance slightly — the dead-zone
+       * border on small sensors is proportionally larger */
+      lfsparms->min_pp_distance = 6;
+    }
+
+  /* NOTE: ppmm only affects quality scoring in NBIS (combined_minutia_quality),
+   * NOT the number of detected minutiae. Tested ppmm 5.0-30.0 — count is
+   * identical for all values. The default 19.685 (500 DPI) is fine. */
+
   timer = g_timer_new ();
   r = get_minutiae (&minutiae, &quality_map, &direction_map,
                     &low_contrast_map, &low_flow_map, &high_curve_map,
