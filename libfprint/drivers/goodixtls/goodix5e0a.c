@@ -675,11 +675,21 @@ scan_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case SCAN_FDT_UP:
-      // Wait for finger lift. Since we don't know the correct FDT_UP payload
-      // for the 5e0a, use a 1.5s delay. This forces a pause between scans,
-      // giving the user time to lift and reposition their finger.
-      fp_dbg ("Pausing 1.5s between scans (lift and reposition finger)...");
-      fpi_ssm_next_state_delayed (ssm, 1500);
+      // Wait for finger lift using FDT_UP (0x34) with the correct payload.
+      // Windows uses the same payload as FDT_DOWN but with first byte 0x1e
+      // (0x0e UP prefix + 0x10 device flag). The device responds when the
+      // finger is lifted (interrupt=0x200).
+      fp_dbg ("Waiting for finger lift (FDT_UP cmd 0x34)...");
+      {
+        GoodixCallbackInfo *cb_info = malloc (sizeof (GoodixCallbackInfo));
+        cb_info->callback = G_CALLBACK (check_none_cmd_5e0a);
+        cb_info->user_data = ssm;
+        goodix_send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_UP,
+                              goodix_5e0a_fdt_up_mode,
+                              sizeof (goodix_5e0a_fdt_up_mode),
+                              NULL, TRUE, 0, TRUE,
+                              goodix_receive_default, cb_info);
+      }
       break;
 
     case SCAN_DONE:
