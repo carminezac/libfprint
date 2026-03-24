@@ -51,6 +51,9 @@ struct _FpiDeviceGoodixTls5e0a
 
   guint8 *prev_scan_data;   // previous scan raw data for diversity check
   guint16 prev_scan_size;
+
+  guint8 fdt_down_payload[35];  // dynamically computed FDT_DOWN payload
+  guint8 fdt_up_payload[35];    // dynamically computed FDT_UP payload
 };
 
 G_DECLARE_FINAL_TYPE (FpiDeviceGoodixTls5e0a, fpi_device_goodixtls5e0a, FPI,
@@ -473,6 +476,7 @@ activate_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 
 enum scan_5e0a_states {
   SCAN_QUERY_MCU,
+  SCAN_READ_FDT_BASE,
   SCAN_FDT_DOWN,
   SCAN_GET_IMAGE,
   SCAN_FDT_UP,
@@ -625,6 +629,98 @@ on_query_mcu_ack_5e0a (FpDevice *dev, gpointer user_data, GError *error)
   fpi_ssm_next_state (ssm);
 }
 
+// DAC base values from OTP (used in FDT payloads)
+static const guint8 dac_base[] = {
+  0xa6, 0x00, 0xa7, 0x00, 0xa6, 0x00, 0xa7, 0x00
+};
+
+// FDT_MANUAL payload to read current sensor baseline
+static const guint8 fdt_manual_payload[] = {
+  0x0D, 0x01,
+  0xa6, 0x00, 0xa7, 0x00, 0xa6, 0x00, 0xa7, 0x00,
+  0x00, 0x00, 0x00, 0x00
+};
+
+static void
+build_fdt_payload (guint8 *payload, guint8 prefix, const guint16 *thresholds)
+{
+  payload[0] = prefix;
+  payload[1] = 0x01;  // has_base flag
+  // bytes [2..9]: DAC base from OTP
+  memcpy (payload + 2, dac_base, 8);
+  // bytes [10..21]: 6 threshold words (LE)
+  for (int i = 0; i < 6; i++)
+    {
+      payload[10 + i * 2]     = thresholds[i] & 0xFF;
+      payload[10 + i * 2 + 1] = (thresholds[i] >> 8) & 0xFF;
+    }
+  // bytes [22..25]: padding
+  memset (payload + 22, 0, 4);
+  // bytes [26..33]: DAC base copy
+  memcpy (payload + 26, dac_base, 8);
+  // byte [34]: trailing zero
+  payload[34] = 0x00;
+}
+
+static void
+on_fdt_manual_response (FpDevice *dev, guint8 *data, guint16 length,
+                        gpointer user_data, GError *error)
+{
+  FpiSsm *ssm = user_data;
+
+  if (error)
+    {
+      fp_warn ("FDT_MANUAL failed: %s — using static thresholds", error->message);
+      g_error_free (error);
+      // Fall back to static payload
+      FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
+      memcpy (self->fdt_down_payload, goodix_5e0a_fdt_down_mode,
+              sizeof (goodix_5e0a_fdt_down_mode));
+      memcpy (self->fdt_up_payload, goodix_5e0a_fdt_up_mode,
+              sizeof (goodix_5e0a_fdt_up_mode));
+      fpi_ssm_next_state (ssm);
+      return;
+    }
+
+  // Response inner data format: [4 bytes header] [12 bytes raw base]
+  // Header: [status, irq_type, touch_flag_lo, touch_flag_hi]
+  // Raw base: 6 zones x uint16_t LE
+  if (length < 16)
+    {
+      fp_warn ("FDT_MANUAL response too short (%d bytes) — using static thresholds",
+               length);
+      FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
+      memcpy (self->fdt_down_payload, goodix_5e0a_fdt_down_mode,
+              sizeof (goodix_5e0a_fdt_down_mode));
+      memcpy (self->fdt_up_payload, goodix_5e0a_fdt_up_mode,
+              sizeof (goodix_5e0a_fdt_up_mode));
+      fpi_ssm_next_state (ssm);
+      return;
+    }
+
+  // Parse the 6 raw base values from bytes [4..15]
+  guint16 raw_base[6];
+  for (int i = 0; i < 6; i++)
+    raw_base[i] = data[4 + i * 2] | (data[4 + i * 2 + 1] << 8);
+
+  // Compute thresholds: threshold[i] = ((raw_base[i] >> 1) << 8) | 0x80
+  guint16 thresholds[6];
+  fp_dbg ("FDT base readings:");
+  for (int i = 0; i < 6; i++)
+    {
+      thresholds[i] = ((raw_base[i] >> 1) << 8) | 0x80;
+      fp_dbg ("  zone %d: raw=0x%04x threshold=0x%04x", i, raw_base[i], thresholds[i]);
+    }
+
+  // Build dynamic FDT_DOWN and FDT_UP payloads
+  FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
+  build_fdt_payload (self->fdt_down_payload, 0x1c, thresholds);
+  build_fdt_payload (self->fdt_up_payload, 0x0e, thresholds);
+
+  fp_dbg ("Built dynamic FDT payloads from sensor baseline");
+  fpi_ssm_next_state (ssm);
+}
+
 static void
 scan_run_state (FpiSsm *ssm, FpDevice *dev)
 {
@@ -647,19 +743,30 @@ scan_run_state (FpiSsm *ssm, FpDevice *dev)
       }
       break;
 
-    case SCAN_FDT_DOWN:
-      fp_dbg ("Waiting for finger (FDT_DOWN)...");
+    case SCAN_READ_FDT_BASE:
+      fp_dbg ("Reading FDT baseline (FDT_MANUAL cmd 0x36)...");
       {
-        // Send FDT_DOWN payload directly via goodix_send_protocol to avoid the
-        // hardcoded 0x0c prefix that goodix_send_mcu_switch_to_fdt_down adds.
-        // The 5e0a device uses 0x1c as the mode byte (already in the payload),
-        // not 0x0c which is for other Goodix models.
+        GoodixCallbackInfo *cb_info = malloc (sizeof (GoodixCallbackInfo));
+        cb_info->callback = G_CALLBACK (on_fdt_manual_response);
+        cb_info->user_data = ssm;
+        goodix_send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_MODE,
+                              fdt_manual_payload,
+                              sizeof (fdt_manual_payload),
+                              NULL, TRUE, GOODIX_TIMEOUT, TRUE,
+                              goodix_receive_default, cb_info);
+      }
+      break;
+
+    case SCAN_FDT_DOWN:
+      fp_dbg ("Waiting for finger (FDT_DOWN) with dynamic thresholds...");
+      {
+        FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
         GoodixCallbackInfo *cb_info = malloc (sizeof (GoodixCallbackInfo));
         cb_info->callback = G_CALLBACK (check_none_cmd_5e0a);
         cb_info->user_data = ssm;
         goodix_send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_DOWN,
-                              goodix_5e0a_fdt_down_mode,
-                              sizeof (goodix_5e0a_fdt_down_mode),
+                              self->fdt_down_payload,
+                              sizeof (self->fdt_down_payload),
                               NULL, TRUE, 0, TRUE,
                               goodix_receive_default, cb_info);
       }
@@ -675,18 +782,17 @@ scan_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case SCAN_FDT_UP:
-      // Wait for finger lift using FDT_UP (0x34) with the correct payload.
-      // Windows uses the same payload as FDT_DOWN but with first byte 0x1e
-      // (0x0e UP prefix + 0x10 device flag). The device responds when the
-      // finger is lifted (interrupt=0x200).
-      fp_dbg ("Waiting for finger lift (FDT_UP cmd 0x34)...");
+      // Wait for finger lift using FDT_UP (0x34) with dynamic thresholds.
+      // The device responds when the finger is lifted (interrupt=0x200).
+      fp_dbg ("Waiting for finger lift (FDT_UP cmd 0x34) with dynamic thresholds...");
       {
+        FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
         GoodixCallbackInfo *cb_info = malloc (sizeof (GoodixCallbackInfo));
         cb_info->callback = G_CALLBACK (check_none_cmd_5e0a);
         cb_info->user_data = ssm;
         goodix_send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_UP,
-                              goodix_5e0a_fdt_up_mode,
-                              sizeof (goodix_5e0a_fdt_up_mode),
+                              self->fdt_up_payload,
+                              sizeof (self->fdt_up_payload),
                               NULL, TRUE, 0, TRUE,
                               goodix_receive_default, cb_info);
       }
