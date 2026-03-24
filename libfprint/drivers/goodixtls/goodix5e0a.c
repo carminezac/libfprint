@@ -445,10 +445,10 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     case ACTIVATE_CALIBRATE:
-      goodix_tls_read_image_5e0a_with_payload (dev,
-          goodix_5e0a_get_image_payload,
-          sizeof (goodix_5e0a_get_image_payload),
-          on_calibration_image, ssm);
+      // Skip calibration during init — GET_IMAGE without finger causes timeout.
+      // The 5e0a sensor requires a finger to be present for image capture.
+      // Calibration would need to be done after the first FDT cycle.
+      fpi_ssm_next_state (ssm);
       break;
 
     case ACTIVATE_DONE:
@@ -900,6 +900,7 @@ fpi_device_goodixtls5e0a_class_init (FpiDeviceGoodixTls5e0aClass *class)
   // Too high (>25) = constant false rejections with so few minutiae.
   // Too low (<12) = potential false accepts.
   img_dev_class->bz3_threshold = 20;
+  img_dev_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
   // Sensor frame: 80 pixels wide, 88 pixels tall
   img_dev_class->img_width = GOODIX_5E0A_WIDTH;    // 80
   img_dev_class->img_height = GOODIX_5E0A_HEIGHT;  // 88
