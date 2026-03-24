@@ -1,7 +1,8 @@
-fprintd_*.log
+builddir/
+*.log
 *.bin
 *.pgm
+*.o
 test_5e0a
 test_5e0a.c
 test_minutiae.c
-builddir/

@@ -30,7 +30,6 @@
 
 #include <glib.h>
 #include <string.h>
-#include <stdio.h>
 #include <stdlib.h>
 
 #include "drivers_api.h"
@@ -64,7 +63,7 @@ G_DEFINE_TYPE (FpiDeviceGoodixTls5e0a, fpi_device_goodixtls5e0a,
 
 // Forward declarations
 static void goodix_5e0a_decode_frame (Goodix5e0aPix *frame, guint32 raw_size, const guint8 *raw_frame);
-static void on_calibration_image (FpDevice *dev, guint8 *data, guint16 len, gpointer user_data, GError *err);
+static void on_calibration_image (FpDevice *dev, guint8 *data, guint16 len, gpointer user_data, GError *err) G_GNUC_UNUSED;
 
 // ---- CALIBRATION ----
 
@@ -101,7 +100,7 @@ on_calibration_image (FpDevice *dev, guint8 *data, guint16 len,
   fpi_ssm_next_state (ssm);
 }
 
-static void
+G_GNUC_UNUSED static void
 linear_subtract_5e0a (Goodix5e0aPix *src, const Goodix5e0aPix *baseline,
                       guint16 len)
 {
@@ -550,33 +549,6 @@ scan_on_read_img_5e0a (FpDevice *dev, guint8 *data, guint16 len,
   //    so border artifacts should be discounted.
   img->flags |= FPI_IMAGE_PARTIAL;
   memcpy (img->data, sharpened, GOODIX_5E0A_FRAME_SIZE);
-
-  // Debug: save raw decrypted data and processed image
-  {
-    FILE *fd;
-    fd = fopen ("/tmp/goodix_5e0a_raw.bin", "wb");
-    if (fd) { fwrite (data, 1, len, fd); fclose (fd); }
-
-    // Save original squashed (before sharpening) for reference
-    fd = fopen ("/tmp/goodix_5e0a_image.pgm", "w");
-    if (fd)
-      {
-        fprintf (fd, "P5 %d %d 255\n", img_w, img_h);
-        fwrite (squashed, 1, GOODIX_5E0A_FRAME_SIZE, fd);
-        fclose (fd);
-      }
-
-    // Save sharpened image that NBIS will process
-    fd = fopen ("/tmp/goodix_5e0a_sharp.pgm", "w");
-    if (fd)
-      {
-        fprintf (fd, "P5 %d %d 255\n", img_w, img_h);
-        fwrite (sharpened, 1, GOODIX_5E0A_FRAME_SIZE, fd);
-        fclose (fd);
-        fp_dbg ("Saved sharpened image to /tmp/goodix_5e0a_sharp.pgm (%dx%d)",
-                img_w, img_h);
-      }
-  }
 
   free (squashed);
   free (sharpened);
