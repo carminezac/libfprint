@@ -23,13 +23,16 @@
 #include "fpi-usb-transfer.h"
 #define FP_COMPONENT "goodixtls"
 
+#include <errno.h>
 #include <gio/gio.h>
 #include <glib.h>
 #include <gusb.h>
 #include <openssl/ssl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "drivers_api.h"
 #include "goodix.h"
@@ -1243,6 +1246,88 @@ goodix_dev_deinit (FpDevice *dev, GError **error)
 
 // ---- TLS SECTION START ----
 
+static void
+tls_hex_dump (const char *label, const guint8 *data, int len)
+{
+  GString *s = g_string_sized_new (len * 3 + 64);
+  g_string_append_printf (s, "TLS-RELAY %s (%d bytes):", label, len);
+  int show = len > 128 ? 128 : len;
+  for (int i = 0; i < show; i++)
+    {
+      if (i % 16 == 0)
+        g_string_append_printf (s, "\n  %04x: ", i);
+      g_string_append_printf (s, "%02x ", data[i]);
+    }
+  if (len > 128)
+    g_string_append_printf (s, "\n  ... (%d more bytes)", len - 128);
+  fp_dbg ("%s", s->str);
+  g_string_free (s, TRUE);
+}
+
+// Read ALL complete TLS records from a socketpair fd.
+// TLS records have a 5-byte header: type(1) + version(2) + length(2).
+// We read records one at a time until poll() says no more data is pending.
+static int
+read_all_tls_records (int fd, guint8 *buf, int buf_size)
+{
+  int total = 0;
+  struct pollfd pfd = { .fd = fd, .events = POLLIN };
+
+  for (;;)
+    {
+      // Read 5-byte TLS record header
+      int hdr_got = 0;
+      while (hdr_got < 5)
+        {
+          if (total + 5 - hdr_got > buf_size)
+            {
+              fp_err ("read_all_tls_records: buffer full at %d bytes", total);
+              return total;
+            }
+          int n = read (fd, buf + total + hdr_got, 5 - hdr_got);
+          if (n <= 0)
+            {
+              fp_err ("read_all_tls_records: read header failed (got %d, errno %d)", n, errno);
+              return n <= 0 && total == 0 ? n : total;
+            }
+          hdr_got += n;
+        }
+
+      // Parse record length from header bytes 3-4 (big-endian)
+      int rec_len = (buf[total + 3] << 8) | buf[total + 4];
+      fp_dbg ("read_all_tls_records: record type=0x%02x ver=0x%02x%02x len=%d",
+              buf[total], buf[total + 1], buf[total + 2], rec_len);
+
+      total += 5;
+
+      // Read the record body
+      int body_got = 0;
+      while (body_got < rec_len)
+        {
+          if (total + rec_len - body_got > buf_size)
+            {
+              fp_err ("read_all_tls_records: buffer full at %d bytes", total);
+              return total;
+            }
+          int n = read (fd, buf + total + body_got, rec_len - body_got);
+          if (n <= 0)
+            {
+              fp_err ("read_all_tls_records: read body failed (got %d, errno %d)", n, errno);
+              return total + body_got;
+            }
+          body_got += n;
+        }
+      total += rec_len;
+
+      // Check if more TLS records are immediately available
+      int ready = poll (&pfd, 1, 50); // 50ms timeout
+      if (ready <= 0 || !(pfd.revents & POLLIN))
+        break; // No more data pending
+    }
+
+  return total;
+}
+
 void
 goodix_read_tls (FpDevice *dev, GoodixTlsCallback callback,
                  gpointer user_data)
@@ -1284,6 +1369,18 @@ on_goodix_tls_read_handshake (FpDevice *dev, guint8 *data,
   FpiDeviceGoodixTlsPrivate *priv =
     fpi_device_goodixtls_get_instance_private (self);
 
+  int stage = fpi_ssm_get_cur_state (ssm);
+  const char *stage_names[] = {
+    "ClientKeyExchange", "ChangeCipherSpec", "ClientFinished"
+  };
+  const char *stage_name = (stage >= 1 && stage <= 3)
+                             ? stage_names[stage - 1]
+                             : "unknown";
+
+  tls_hex_dump (stage_name, data, length);
+  fp_dbg ("TLS-RELAY stage %d (%s): writing %d bytes to client_fd",
+          stage, stage_name, length);
+
   int sent = goodix_tls_client_write (priv->tls_hop, data, length);
 
   if (sent < 0)
@@ -1293,6 +1390,7 @@ on_goodix_tls_read_handshake (FpDevice *dev, guint8 *data,
                                              "tls server"));
       return;
     }
+  fp_dbg ("TLS-RELAY stage %d: wrote %d/%d bytes", stage, sent, length);
   fpi_ssm_next_state (ssm);
 }
 
@@ -1337,17 +1435,21 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
 
   int stage = fpi_ssm_get_cur_state (ssm);
 
+  fp_dbg ("TLS-RELAY handshake_run stage=%d", stage);
+
   if (stage == TLS_HANDSHAKE_STAGE_HELLO_S)
     {
-      guint8 buff[1024];
-      int size = goodix_tls_client_read (priv->tls_hop, buff, sizeof (buff));
-      if (size < 0)
+      guint8 buff[4096];
+      int size = read_all_tls_records (priv->tls_hop->client_fd,
+                                       buff, sizeof (buff));
+      if (size <= 0)
         {
           fpi_ssm_mark_failed (ssm, g_error_new (g_io_error_quark (), size,
                                                  "failed to read tls server "
                                                  "hello"));
           return;
         }
+      tls_hex_dump ("ServerHello flight (server->device)", buff, size);
       GError *err = NULL;
       if (!goodix_send_pack (dev, GOODIX_FLAGS_TLS, buff, size, NULL, &err))
         {
@@ -1364,10 +1466,11 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
     }
   else if (stage == TLS_HANDSHAKE_STAGE_CHANGE_CIPHER_S)
     {
-      fp_dbg ("Reading to proxy back");
-      guint8 buff[1024];
-      int size = goodix_tls_client_read (priv->tls_hop, buff, sizeof (buff));
-      if (size < 0)
+      fp_dbg ("TLS-RELAY: reading server ChangeCipherSpec+Finished");
+      guint8 buff[4096];
+      int size = read_all_tls_records (priv->tls_hop->client_fd,
+                                       buff, sizeof (buff));
+      if (size <= 0)
         {
           fpi_ssm_mark_failed (ssm, g_error_new (g_io_error_quark (), size,
                                                  "failed to read server "
@@ -1375,6 +1478,7 @@ tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
 
           return;
         }
+      tls_hex_dump ("ServerCCS+Finished (server->device)", buff, size);
       GError *err = NULL;
       if (!goodix_send_pack (dev, GOODIX_FLAGS_TLS, buff, size, NULL, &err))
         {
@@ -1407,6 +1511,7 @@ on_goodix_request_tls_connection (FpDevice *dev, guint8 *data,
   FpiDeviceGoodixTlsPrivate *priv =
     fpi_device_goodixtls_get_instance_private (self);
 
+  tls_hex_dump ("ClientHello (device->server)", data, length);
   goodix_tls_client_write (priv->tls_hop, data, length);
 
   do_tls_handshake (dev);
@@ -1548,6 +1653,18 @@ on_goodix_image_tls_read_handshake (FpDevice *dev, guint8 *data,
   FpiDeviceGoodixTlsPrivate *priv =
     fpi_device_goodixtls_get_instance_private (self);
 
+  int stage = fpi_ssm_get_cur_state (ssm);
+  const char *stage_names[] = {
+    "IMG-ClientKeyExchange", "IMG-ChangeCipherSpec", "IMG-ClientFinished"
+  };
+  const char *stage_name = (stage >= 1 && stage <= 3)
+                             ? stage_names[stage - 1]
+                             : "IMG-unknown";
+
+  tls_hex_dump (stage_name, data, length);
+  fp_dbg ("TLS-RELAY img stage %d (%s): writing %d bytes to client_fd",
+          stage, stage_name, length);
+
   int sent = goodix_tls_client_write (priv->image_tls_hop, data, length);
 
   if (sent < 0)
@@ -1557,6 +1674,7 @@ on_goodix_image_tls_read_handshake (FpDevice *dev, guint8 *data,
                                              "image tls server"));
       return;
     }
+  fp_dbg ("TLS-RELAY img stage %d: wrote %d/%d bytes", stage, sent, length);
   fpi_ssm_next_state (ssm);
 }
 
@@ -1592,17 +1710,21 @@ image_tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
 
   int stage = fpi_ssm_get_cur_state (ssm);
 
+  fp_dbg ("TLS-RELAY image handshake_run stage=%d", stage);
+
   if (stage == IMG_TLS_HANDSHAKE_STAGE_HELLO_S)
     {
-      guint8 buff[1024];
-      int size = goodix_tls_client_read (priv->image_tls_hop, buff, sizeof (buff));
-      if (size < 0)
+      guint8 buff[4096];
+      int size = read_all_tls_records (priv->image_tls_hop->client_fd,
+                                       buff, sizeof (buff));
+      if (size <= 0)
         {
           fpi_ssm_mark_failed (ssm, g_error_new (g_io_error_quark (), size,
                                                  "failed to read image tls "
                                                  "server hello"));
           return;
         }
+      tls_hex_dump ("IMG-ServerHello flight (server->device)", buff, size);
       GError *err = NULL;
       if (!goodix_send_pack (dev, GOODIX_FLAGS_TLS, buff, size, NULL, &err))
         {
@@ -1618,16 +1740,18 @@ image_tls_handshake_run (FpiSsm *ssm, FpDevice *dev)
     }
   else if (stage == IMG_TLS_HANDSHAKE_STAGE_CHANGE_CIPHER_S)
     {
-      fp_dbg ("Image TLS: reading to proxy back");
-      guint8 buff[1024];
-      int size = goodix_tls_client_read (priv->image_tls_hop, buff, sizeof (buff));
-      if (size < 0)
+      fp_dbg ("TLS-RELAY: reading image server ChangeCipherSpec+Finished");
+      guint8 buff[4096];
+      int size = read_all_tls_records (priv->image_tls_hop->client_fd,
+                                       buff, sizeof (buff));
+      if (size <= 0)
         {
           fpi_ssm_mark_failed (ssm, g_error_new (g_io_error_quark (), size,
                                                  "failed to read image "
                                                  "server handshake"));
           return;
         }
+      tls_hex_dump ("IMG-ServerCCS+Finished (server->device)", buff, size);
       GError *err = NULL;
       if (!goodix_send_pack (dev, GOODIX_FLAGS_TLS, buff, size, NULL, &err))
         {
@@ -1661,6 +1785,7 @@ on_goodix_request_image_tls_connection (FpDevice *dev, guint8 *data,
   FpiDeviceGoodixTlsPrivate *priv =
     fpi_device_goodixtls_get_instance_private (self);
 
+  tls_hex_dump ("IMG-ClientHello (device->server)", data, length);
   goodix_tls_client_write (priv->image_tls_hop, data, length);
   do_image_tls_handshake (dev);
 }

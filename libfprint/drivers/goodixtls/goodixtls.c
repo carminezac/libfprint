@@ -76,7 +76,12 @@ tls_server_psk_server_callback (SSL           *ssl,
       len = server->psk_len;
     }
 
-  fp_dbg ("PSK WANTED %d (using %s PSK, len=%u)", max_psk_len,
+  fp_dbg ("PSK callback: identity='%s', max_psk_len=%d, server=%p, "
+          "psk_data=%p, psk_len=%u, using %s PSK, len=%u",
+          identity ? identity : "(null)", max_psk_len,
+          (void *)server,
+          server ? (void *)server->psk_data : NULL,
+          server ? server->psk_len : 0,
           psk_source ? "custom" : "zero", len);
 
   if (len > max_psk_len)
@@ -89,6 +94,10 @@ tls_server_psk_server_callback (SSL           *ssl,
     memcpy (psk, psk_source, len);
   else
     memset (psk, 0, len);
+
+  // Log first 8 bytes of PSK being returned
+  fp_dbg ("PSK returned (%u bytes): %02x %02x %02x %02x %02x %02x %02x %02x ...",
+          len, psk[0], psk[1], psk[2], psk[3], psk[4], psk[5], psk[6], psk[7]);
 
   return len;
 }
@@ -160,7 +169,8 @@ goodix_tls_init_serve (void *me)
 
   fp_dbg ("TLS server accept done");
   if (retr <= 0)
-    fp_err ("server ready failed: %s", ERR_reason_error_string (ERR_get_error ()));
+    fp_warn ("server accept failed (may be expected for command TLS): %s",
+             ERR_reason_error_string (ERR_get_error ()));
   else
     fp_dbg ("TLS connection ready");
   return NULL;
