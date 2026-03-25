@@ -142,7 +142,7 @@ A **fully working driver** exists in the community fork at
 [goodix-fp-linux-dev/libfprint](https://github.com/goodix-fp-linux-dev/libfprint)
 (branch: `goodixtls`). Both enrollment and verification are functional.
 
-[TODO: link to PR]
+https://github.com/goodix-fp-linux-dev/libfprint/pull/34
 
 #### Technical summary
 
