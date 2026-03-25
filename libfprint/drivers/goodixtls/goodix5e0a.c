@@ -31,11 +31,16 @@
 #include <glib.h>
 #include <string.h>
 #include <stdlib.h>
+#include <openssl/evp.h>
 
 #include "drivers_api.h"
 #include "goodix.h"
 #include "goodix_proto.h"
 #include "goodix5e0a.h"
+
+// ---- PSK FILE PATH ----
+
+#define GOODIX_5E0A_PSK_FILE "/etc/libfprint/goodix-5e0a.psk"
 
 typedef unsigned short Goodix5e0aPix;
 
@@ -138,6 +143,21 @@ check_none_cmd_5e0a (FpDevice *dev, guint8 *data, guint16 len,
       return;
     }
   fpi_ssm_next_state (ssm);
+}
+
+// Compute SHA-256 of data into out (must be 32 bytes)
+static gboolean
+compute_sha256 (const guint8 *data, gsize len, guint8 *out)
+{
+  EVP_MD_CTX *mdctx = EVP_MD_CTX_new ();
+  if (!mdctx) return FALSE;
+
+  unsigned int md_len = 32;
+  gboolean ok = EVP_DigestInit_ex (mdctx, EVP_sha256 (), NULL) &&
+                EVP_DigestUpdate (mdctx, data, len) &&
+                EVP_DigestFinal_ex (mdctx, out, &md_len);
+  EVP_MD_CTX_free (mdctx);
+  return ok;
 }
 
 // ---- FRAME DECODE ----
@@ -317,30 +337,52 @@ enum activate_5e0a_states {
 
 static void
 on_psk_read_5e0a (FpDevice *dev, gboolean success, guint32 flags,
-                  guint8 *psk, guint16 length, gpointer user_data,
+                  guint8 *device_hash, guint16 length, gpointer user_data,
                   GError *error)
 {
   FpiSsm *ssm = user_data;
+  FpiDeviceGoodixTls5e0a *self = FPI_DEVICE_GOODIXTLS5E0A (dev);
 
   if (error)
     {
-      fpi_ssm_mark_failed (ssm, error);
-      return;
-    }
-
-  if (!success)
-    {
-      fp_warn ("PSK read returned failure, continuing with placeholder PSK");
+      fp_warn ("PSK read error: %s", error->message);
+      g_error_free (error);
+      // Continue anyway — image TLS may still work or fail gracefully
       fpi_ssm_next_state (ssm);
       return;
     }
 
-  g_autofree gchar *psk_str = data_to_str (psk, length);
-  fp_dbg ("Device PSK hash: 0x%s (flags: 0x%08x)", psk_str, flags);
+  if (!success || length < 32)
+    {
+      fp_warn ("PSK read returned failure or short hash (len=%d)", length);
+      fpi_ssm_next_state (ssm);
+      return;
+    }
 
-  // The psk returned by preset_psk_read with flags 0xbb020001 is a hash/check,
-  // not the actual image PSK. The real PSK must be obtained separately
-  // (e.g., from Windows registry via DPAPI, or from a config file).
+  g_autofree gchar *hash_str = data_to_str (device_hash, length);
+  fp_dbg ("Device PSK hash: 0x%s (flags: 0x%08x)", hash_str, flags);
+
+  // If we have a PSK loaded from file, verify it matches the device hash
+  if (self->has_image_psk)
+    {
+      guint8 expected_hash[32];
+      if (compute_sha256 (self->image_psk, 32, expected_hash) &&
+          memcmp (device_hash, expected_hash, 32) == 0)
+        {
+          fp_info ("PSK verified successfully");
+          fpi_ssm_next_state (ssm);
+          return;
+        }
+
+      fp_warn ("PSK file does NOT match device hash — will not erase device");
+      fp_warn ("Run extract_psk.py or whitebox_encrypt.py to set up PSK manually");
+      fp_warn ("See https://github.com/carminezac/libfprint-goodix for instructions");
+    }
+  else
+    {
+      fp_warn ("No valid PSK — run extract_psk.py or whitebox_encrypt.py to set up PSK");
+      fp_warn ("See https://github.com/carminezac/libfprint-goodix for instructions");
+    }
 
   fpi_ssm_next_state (ssm);
 }
@@ -428,18 +470,19 @@ activate_run_state (FpiSsm *ssm, FpDevice *dev)
     case ACTIVATE_IMG_TLS:
       {
         // Image TLS with the device-specific PSK.
-        // TODO: Read the actual device-specific PSK from a config file
-        // (e.g., ~/.config/libfprint/goodix-5e0a.psk) or extract it at runtime.
-        // For now, use the PSK stored in self->image_psk if available,
-        // otherwise fall back to 32 zero bytes as a placeholder.
+        // After ACTIVATE_CHECK_PSK, self->image_psk should be populated
+        // either from file or from auto-enrollment.
         const guint8 *psk = self->image_psk;
         guint psk_len = 32;
 
         if (!self->has_image_psk)
           {
-            fp_warn ("No device-specific image PSK available, using zeros. "
-                     "Image decryption will fail unless the correct PSK is "
-                     "provided.");
+            fp_warn ("No image PSK available — image TLS will likely fail. "
+                     "Run extract_psk.py or whitebox_encrypt.py to set up PSK.");
+          }
+        else
+          {
+            fp_info ("Starting image TLS with PSK from file");
           }
 
         goodix_tls_init_image (dev, psk, psk_len, on_img_tls_complete, ssm);
@@ -944,9 +987,7 @@ fpi_device_goodixtls5e0a_init (FpiDeviceGoodixTls5e0a *self)
   //   /etc/libfprint/goodix-5e0a.psk
   //   ~/.config/libfprint/goodix-5e0a.psk
   if (!load_psk_from_file (self))
-    fp_warn ("No image PSK loaded — image TLS will fail. "
-             "Run extract_psk.py and save PSK to "
-             "/etc/libfprint/goodix-5e0a.psk");
+    fp_warn ("No PSK file found — run extract_psk.py or whitebox_encrypt.py to set up PSK");
 }
 
 static void
