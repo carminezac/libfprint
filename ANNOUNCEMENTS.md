@@ -77,7 +77,7 @@ installation where the Goodix driver has been used at least once:
 4. Place the resulting 32-byte hex key at `/etc/libfprint/goodix-5e0a.psk`.
 
 Python tooling for the extraction process:
-[TODO: link to goodix-fp-dump/psk-extract tool]
+https://github.com/carminezac/libfprint-goodix/blob/goodixtls/tools/extract_psk.py
 
 #### Build dependencies
 
@@ -182,7 +182,7 @@ in several important ways:
 
 #### References
 
-- Community fork PR: [TODO: link]
+- Community fork PR: https://github.com/carminezac/libfprint-goodix
 - Python protocol tools: [TODO: link to goodix-fp-dump]
 - SIGFM matcher: https://github.com/bertin0/libfprint-sigfm
 - Neodyme/tlambertz Goodix TLS research: https://blog.neodyme.io/posts/goodix-fingerprint-reader
