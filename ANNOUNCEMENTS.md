@@ -10,7 +10,7 @@
 
 This PR adds full enrollment and verification support for the Goodix 27c6:5e0a
 fingerprint sensor (firmware `GFUSB_GM168SEC_APP_10034`), commonly found in
-Lenovo ThinkPad and other laptop models.
+realme Book Prime and other laptop models.
 
 #### Device details
 
@@ -129,7 +129,7 @@ Documentation:
 - **Firmware version:** `GFUSB_GM168SEC_APP_10034`
 - **Chip family:** Goodix "Chicago H" / Milan HU series
 - **Sensor:** 80x88 pixels, 12-bit depth
-- **Found in:** Lenovo ThinkPad laptops (and likely other OEM models)
+- **Found in:** realme Book Prime (and likely other OEM models using this sensor)
 
 `lsusb` output:
 ```
@@ -195,8 +195,8 @@ in several important ways:
 
 ### Body
 
-**TL;DR:** The Goodix 27c6:5e0a fingerprint sensor (found in many Lenovo
-ThinkPads and other laptops) now works on Linux. Enrollment and verification
+**TL;DR:** The Goodix 27c6:5e0a fingerprint sensor (found in the realme Book Prime and possibly other
+the realme Book Prime and other laptops) now works on Linux. Enrollment and verification
 are fully functional. The driver is available in the goodix-fp-linux-dev
 community fork of libfprint.
 
@@ -282,7 +282,7 @@ Happy to answer questions about the RE process or the driver architecture.
 #### Overview
 
 Full enrollment and verification support for the Goodix 27c6:5e0a fingerprint
-sensor, a small (80x88) capacitive sensor found in Lenovo ThinkPad and other
+sensor, a small (80x88) capacitive sensor found in realme Book Prime and other
 laptop models. The driver implements a dual TLS-PSK protocol with dynamic FDT
 calibration and uses SIFT-based fingerprint matching (SIGFM) instead of
 NBIS/Bozorth3.
